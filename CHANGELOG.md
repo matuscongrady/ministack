@@ -10,6 +10,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **CloudTrail — new trails start with logging off** — `CreateTrail` left a new trail logging, and `GetTrailStatus` reported a `StartLoggingTime` an hour back and a `LatestDeliveryTime` of now. A new trail now reports `IsLogging` false until `StartLogging`, and `GetTrailStatus` returns only the `StartLoggingTime` and `StopLoggingTime` of calls made (a restart keeps the last stop time), without `LatestDeliveryTime` or empty error strings. Contributed by @iot-rocket.
+- **CloudFormation — EventBridge rules accept a bus ARN** — `AWS::Events::Rule` stored an ARN-valued `EventBusName` as the bus name, so `PutEvents` succeeded without delivering to its targets. Create, update, delete and drift detection now resolve the ARN through the existing EventBridge parser and use the bus name internally.
+
 ## [1.5.26] — 2026-10-11
 
 ### Fixed
