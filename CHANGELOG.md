@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — API Gateway v2 stage `Ref`** — `Ref` returned `<apiId>/<stageName>`, causing an `AWS::ApiGatewayV2::ApiMapping` using the reference as its `Stage` to fail with `Invalid stage identifier specified`; new stages now return the stage name. Stage updates, replacement on `ApiId` or `StageName` changes, and deletion use the resolved resource properties, including for stacks with legacy physical IDs.
 - **IoT — rule SQL `principal()` and `traceid()`** — both resolved to Undefined; `principal()` now returns the client certificate id for mTLS, the caller's `GetCallerIdentity` `UserId` for HTTP Publish and SigV4 WebSocket sessions (also their lifecycle events' `principalIdentifier`) and the rule role's session for a republish, and `traceid()` returns a per-message id that the errorAction document carries as `cloudwatchTraceId`. Contributed by @iot-rocket.
 ### Added
 
