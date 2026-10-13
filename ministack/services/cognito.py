@@ -466,7 +466,7 @@ _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 
 _authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
-_revoked_tokens: set = set()                 # refresh-token values invalidated by RevokeToken
+_revoked_tokens: set = set()                 # refresh tokens and origin_jti values revoked
 
 # ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
@@ -745,29 +745,39 @@ def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
     return pool_id
 
 
+_VALIDITY_UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+
+
+def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
+    """Seconds a token of this app client is valid, by its settings or the AWS default."""
+    client = ((_user_pools.get(pool_id) or {}).get("_clients") or {}).get(client_id) or {}
+    kind, value, unit = {"id": ("IdToken", 1, "hours"), "refresh": ("RefreshToken", 30, "days")}.get(
+        token_type, ("AccessToken", 1, "hours"))
+    value = client.get(f"{kind}Validity") or value
+    unit = (client.get("TokenValidityUnits") or {}).get(kind) or unit
+    return int(value) * _VALIDITY_UNIT_SECONDS.get(unit, 3600)
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
-                 client_metadata: dict | None = None) -> str:
+                 client_metadata: dict | None = None, origin_jti: str = "") -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
     Refresh tokens are opaque in AWS and skip the trigger.
     """
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
-    ).rstrip(b"=").decode()
     now = int(time.time())
-    origin_jti = new_uuid()
+    origin_jti = origin_jti or new_uuid()
     claims = {
         "sub": sub,
         "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
         "token_use": token_type,
         "iat": now,
-        "exp": now + 3600,
+        "exp": now + _token_validity(pool_id, client_id, token_type),
         "jti": new_uuid(),
     }
     if token_type == "id":
@@ -814,6 +824,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     else:
         # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
         claims["client_id"] = client_id
+        claims["origin_jti"] = origin_jti
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -827,7 +838,14 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             groups=groups or [],
             client_metadata=client_metadata,
         )
+    return _signed_jwt(claims)
 
+
+def _signed_jwt(claims: dict) -> str:
+    """A JWT over *claims*, signed with the RSA key when cryptography is available."""
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
+    ).rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
@@ -1110,6 +1128,51 @@ def _build_presignup_event(pool_id: str, client_id: str, username: str,
             "autoVerifyPhone": False,
         },
     }
+
+
+def _token_claims(token) -> dict:
+    """The unverified claims of a JWT, or {} when it is not one."""
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, AttributeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _signature_valid(token: str) -> bool:
+    """Whether a JWT is signed with this emulator's signing key."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    signing_input, _, sig = token.rpartition(".")
+    try:
+        _RSA_PRIVATE_KEY.public_key().verify(
+            base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), signing_input.encode(),
+            padding.PKCS1v15(), hashes.SHA256())
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def _access_token_error(data: dict):
+    """The NotAuthorizedException for an AccessToken AWS would not accept, or None."""
+    token = data.get("AccessToken")
+    if not token or not isinstance(token, str):
+        return None
+    claims = _token_claims(token)
+    if token.count(".") != 2 or not claims:
+        message = "Invalid Access Token"
+    elif claims.get("token_use") != "access":
+        message = "Invalid Access Token"
+    elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+        message = "Could not verify signature for Access Token"
+    elif not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]:
+        message = "Access Token has expired"
+    elif claims.get("origin_jti") in _revoked_tokens:
+        message = "Access Token has been revoked"
+    else:
+        return None
+    return error_response_json("NotAuthorizedException", message, 400)
 
 
 def _user_from_token(token: str, pool: dict):
@@ -2341,7 +2404,7 @@ def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
     from ministack.app import AUTH
-    error = _validate_client_secret_hash(action, data) if AUTH else None
+    error = (_validate_client_secret_hash(action, data) or _access_token_error(data)) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -2734,8 +2797,8 @@ def _create_user_pool_client(data):
         "CreationDate": now,
         "LastModifiedDate": now,
         "RefreshTokenValidity": data.get("RefreshTokenValidity", 30),
-        "AccessTokenValidity": data.get("AccessTokenValidity", 60),
-        "IdTokenValidity": data.get("IdTokenValidity", 60),
+        "AccessTokenValidity": data.get("AccessTokenValidity"),
+        "IdTokenValidity": data.get("IdTokenValidity"),
         "TokenValidityUnits": data.get("TokenValidityUnits", {}),
         "ReadAttributes": data.get("ReadAttributes", []),
         "WriteAttributes": data.get("WriteAttributes", []),
@@ -3644,6 +3707,7 @@ def _admin_user_global_sign_out(data):
     # Invalidate every token issued before now (checked by REFRESH_TOKEN_AUTH)
     # and drop the user's OAuth-flow refresh tokens.
     user["_signout_at"] = _now_epoch()
+    _revoked_tokens.update(user.pop("_origin_jtis", []))
     uname = user.get("Username", username)
     for tok in [t for t, e in _refresh_tokens.items()
                 if e.get("username") == uname and e.get("pool_id") == pid]:
@@ -3765,7 +3829,10 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
-                        client_metadata: dict | None = None) -> dict:
+                        client_metadata: dict | None = None, origin_jti: str = "") -> dict:
+    if not origin_jti:
+        origin_jti = new_uuid()
+        user.setdefault("_origin_jtis", []).append(origin_jti)
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
@@ -3774,14 +3841,14 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
                                     trigger_source=trigger_source,
-                                    client_metadata=client_metadata),
+                                    client_metadata=client_metadata, origin_jti=origin_jti),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
                                trigger_source=trigger_source,
-                               client_metadata=client_metadata),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
+                               client_metadata=client_metadata, origin_jti=origin_jti),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti),
         "TokenType": "Bearer",
-        "ExpiresIn": 3600,
+        "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
 
 
@@ -4170,7 +4237,8 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
     if err:
         return None, err
-    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens")
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
+                                origin_jti=_token_claims(refresh_token).get("origin_jti", ""))
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
@@ -4457,6 +4525,7 @@ def _global_sign_out(data):
         user = pool["_users"].get(username)
         if user:
             user["_signout_at"] = _now_epoch()
+            _revoked_tokens.update(user.pop("_origin_jtis", []))
     if username and pool_id:
         for tok in [t for t, e in _refresh_tokens.items()
                     if e.get("username") == username and e.get("pool_id") == pool_id]:
@@ -4471,6 +4540,9 @@ def _revoke_token(data):
     if token:
         _revoked_tokens.add(token)
         _refresh_tokens.pop(token, None)
+        claims = _token_claims(token)
+        if claims.get("token_use") == "refresh" and claims.get("origin_jti"):
+            _revoked_tokens.add(claims["origin_jti"])
     return json_response({})
 
 
@@ -6740,7 +6812,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "id_token": result["IdToken"],
                 "refresh_token": refresh_val,
                 "token_type": "Bearer",
-                "expires_in": 3600,
+                "expires_in": result["ExpiresIn"],
             }
             return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
@@ -6760,27 +6832,29 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
             user_attrs = {}
             groups = []
+            origin_jti = new_uuid()
             pool = _get_pool_unscoped(pool_id)
             if pool:
                 user = pool["_users"].get(username)
                 if user:
                     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
                     groups = user.get("_groups", [])
+                    user.setdefault("_origin_jtis", []).append(origin_jti)
 
             access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
                                         user_attrs=user_attrs, groups=groups,
-                                        trigger_source="TokenGeneration_HostedAuth")
+                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti)
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
                                     groups=groups, trigger_source="TokenGeneration_HostedAuth",
-                                    nonce=code_data.get("nonce", ""))
-            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh")
+                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti)
+            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti)
 
             return json_response({
                 "id_token": id_token,
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
-                "expires_in": 3600,
+                "expires_in": _token_validity(pool_id, effective_client_id, "access"),
             })
 
         return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
@@ -6809,13 +6883,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         attrs = _attr_list_to_dict(user.get("Attributes", []))
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
+        origin_jti = _token_claims(refresh_val).get("origin_jti", "")
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                         trigger_source="TokenGeneration_RefreshTokens"),
+                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
-                                     trigger_source="TokenGeneration_RefreshTokens"),
+                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, client_id, "access"),
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
@@ -6850,7 +6925,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, cid, "access"),
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
@@ -7071,6 +7146,32 @@ def _get_id(data):
     return json_response({"IdentityId": identity_id})
 
 
+def _identity_login_fields(logins: dict) -> tuple[list[str], list[str]]:
+    """The amr list and the API Gateway provider strings of an identity's logins."""
+    # The provider string is "<provider>,<provider>:CognitoSignIn:<sub>" per
+    # the mapping template reference, sub from the login's id token.
+    provider_parts = []
+    amr = ["authenticated"] if logins else ["unauthenticated"]
+    for provider_name, login_token in logins.items():
+        sub = ""
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(
+                login_token.split(".")[1] + "=="))
+            sub = payload.get("sub", "")
+        except Exception:
+            pass
+        # amr carries the bare provider name (what trust policies match with
+        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
+        # user-pool sign-in, the CognitoSignIn entry alongside it.
+        amr.append(provider_name)
+        if sub:
+            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
+            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
+        else:
+            provider_parts.append(provider_name)
+    return amr, provider_parts
+
+
 def _get_credentials_for_identity(data):
     """Vend identity-pool credentials AND register them as an STS session.
 
@@ -7104,28 +7205,8 @@ def _get_credentials_for_identity(data):
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
 
     # The cognito* identity fields API Gateway reports for IAM-authorized
-    # calls, precomputed here where the login tokens are at hand: the provider
-    # string is "<provider>,<provider>:CognitoSignIn:<sub>" per the mapping
-    # template reference, sub from the login's id token.
-    provider_parts = []
-    amr = ["authenticated"] if logins else ["unauthenticated"]
-    for provider_name, login_token in logins.items():
-        sub = ""
-        try:
-            payload = json.loads(base64.urlsafe_b64decode(
-                login_token.split(".")[1] + "=="))
-            sub = payload.get("sub", "")
-        except Exception:
-            pass
-        # amr carries the bare provider name (what trust policies match with
-        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
-        # user-pool sign-in, the CognitoSignIn entry alongside it.
-        amr.append(provider_name)
-        if sub:
-            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
-            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
-        else:
-            provider_parts.append(provider_name)
+    # calls, precomputed here where the login tokens are at hand.
+    amr, provider_parts = _identity_login_fields(logins)
 
     from ministack.services import sts as sts_svc
     sts_svc.register_session(access_key, {
@@ -7160,12 +7241,26 @@ def _get_open_id_token(data):
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
+    logins = data.get("Logins") or {}
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
-    token = _fake_token(identity_id, pool_id, "", "id")
-    return json_response({"IdentityId": identity_id, "Token": token})
+    if not pool_id:
+        return error_response_json("ResourceNotFoundException", f"Identity '{identity_id}' not found.", 400)
+    now = int(time.time())
+    claims = {
+        "sub": identity_id,
+        "aud": pool_id,
+        "amr": _identity_login_fields(logins)[0],
+        "iss": "https://cognito-identity.amazonaws.com",
+        "iat": now,
+        "exp": now + 600,
+        "https://cognito-identity.amazonaws.com/identity-pool-arn": (
+            f"arn:aws:cognito-identity:{get_region()}:{get_account_id()}:identitypool/{pool_id}"),
+    }
+    return json_response({"IdentityId": identity_id, "Token": _signed_jwt(claims)})
 
 
 def _set_identity_pool_roles(data):
@@ -7419,6 +7514,7 @@ def reset():
     _auth_codes.clear()
     _authorization_codes.clear()
     _refresh_tokens.clear()
+    _revoked_tokens.clear()
     _challenge_sessions.clear()
     _pending_new_password.clear()
     _pending_user_auth.clear()
