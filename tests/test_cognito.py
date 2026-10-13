@@ -459,6 +459,50 @@ def test_cognito_forgot_password_and_confirm(cognito_idp):
     )
     assert "AuthenticationResult" in auth
 
+
+def test_cognito_confirmation_codes_checked_under_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    pid, cid, _ = _password_client_with_users(call, "alice", "bob")
+    mismatch = ("CodeMismatchException", "Invalid verification code provided, please try again.")
+    expired = ("ExpiredCodeException", "Invalid code provided, please request a code again.")
+
+    call("SignUp", ClientId=cid, Username="carol", Password="Passw0rd!")
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="000000") == mismatch
+    assert call("AdminGetUser", UserPoolId=pid, Username="carol")["UserStatus"] == "UNCONFIRMED"
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="123456") == {}
+    call("AdminCreateUser", UserPoolId=pid, Username="dave", TemporaryPassword="Passw0rd!", MessageAction="SUPPRESS")
+    for name, status in (("carol", "CONFIRMED"), ("alice", "CONFIRMED"), ("dave", "FORCE_CHANGE_PASSWORD")):
+        assert call("ConfirmSignUp", ClientId=cid, Username=name, ConfirmationCode="123456") == (
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {status}")
+
+    def reset(name, code, password="Passw0rd!2"):
+        return call("ConfirmForgotPassword", ClientId=cid, Username=name, ConfirmationCode=code, Password=password)
+
+    def sign_in(name, password):
+        return call("InitiateAuth", ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                    AuthParameters={"USERNAME": name, "PASSWORD": password})
+
+    assert reset("alice", "654321") == expired
+    assert "AuthenticationResult" in sign_in("alice", "Passw0rd!")
+    call("ForgotPassword", ClientId=cid, Username="bob")
+    assert reset("bob", "000000") == mismatch
+    assert reset("bob", "000000", password="weak") == mismatch
+    assert "AuthenticationResult" in sign_in("bob", "Passw0rd!")
+    assert reset("bob", "654321") == {}
+    assert "AuthenticationResult" in sign_in("bob", "Passw0rd!2")
+    assert reset("bob", "654321") == expired
+
+
+def test_cognito_confirmation_codes_not_checked_without_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=False)
+    pid, cid, _ = _password_client_with_users(call, "alice")
+    call("SignUp", ClientId=cid, Username="carol", Password="Passw0rd!")
+    assert call("ConfirmSignUp", ClientId=cid, Username="carol", ConfirmationCode="000000") == {}
+    assert call("AdminGetUser", UserPoolId=pid, Username="carol")["UserStatus"] == "CONFIRMED"
+    assert call("ConfirmForgotPassword", ClientId=cid, Username="alice", ConfirmationCode="000000",
+                Password="Passw0rd!2") == {}
+
+
 def test_cognito_admin_update_user_attributes(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="UpdateAttrPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(
@@ -6949,6 +6993,67 @@ def test_custom_auth_client_missing_explicit_flow(cognito_idp):
             AuthParameters={"USERNAME": "user@example.com"},
         )
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "CUSTOM_AUTH is not enabled for the client."
+
+
+@pytest.mark.parametrize("flows", [None, ["ADMIN_NO_SRP_AUTH"], ["USER_PASSWORD_AUTH"]])
+def test_custom_auth_enabled_without_allow_entries(cognito_idp, flows):
+    """A client without ALLOW_ entries in ExplicitAuthFlows keeps CUSTOM_AUTH enabled."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomAuthDefaultPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", **({"ExplicitAuthFlows": flows} if flows else {}),
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    answer = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "alice"})
+    assert answer["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
+_FLOW_REFUSALS = {
+    "USER_PASSWORD_AUTH": "USER_PASSWORD_AUTH flow not enabled for this client",
+    "ADMIN_USER_PASSWORD_AUTH": "Auth flow not enabled for this client",
+    "ADMIN_NO_SRP_AUTH": "Auth flow not enabled for this client",
+    "CUSTOM_AUTH": "CUSTOM_AUTH is not enabled for the client.",
+}
+
+
+def _sign_in_with_each_flow(call, flows):
+    """{auth flow: the InitiateAuth / AdminInitiateAuth answer} on a new client with these ExplicitAuthFlows."""
+    pid = call("CreateUserPool", PoolName="AuthFlowsPool")["UserPool"]["Id"]
+    call("AdminCreateUser", UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    call("AdminSetUserPassword", UserPoolId=pid, Username="alice", Password="Passw0rd!", Permanent=True)
+    cid = call("CreateUserPoolClient", UserPoolId=pid, ClientName="app",
+               ExplicitAuthFlows=flows)["UserPoolClient"]["ClientId"]
+    password = {"USERNAME": "alice", "PASSWORD": "Passw0rd!"}
+    return {flow: call("AdminInitiateAuth" if flow.startswith("ADMIN") else "InitiateAuth",
+                       UserPoolId=pid, ClientId=cid, AuthFlow=flow,
+                       AuthParameters={"USERNAME": "alice"} if flow == "CUSTOM_AUTH" else password)
+            for flow in _FLOW_REFUSALS}
+
+
+@pytest.mark.parametrize("flows, enabled", [
+    (["ALLOW_REFRESH_TOKEN_AUTH"], set()),
+    (["ALLOW_USER_PASSWORD_AUTH"], {"USER_PASSWORD_AUTH"}),
+    (["ALLOW_ADMIN_USER_PASSWORD_AUTH"], {"ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"}),
+    (["ALLOW_CUSTOM_AUTH"], {"CUSTOM_AUTH"}),
+    (["ADMIN_NO_SRP_AUTH"], {"ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH"}),
+    (["USER_PASSWORD_AUTH"], {"USER_PASSWORD_AUTH", "CUSTOM_AUTH"}),
+    ([], set(_FLOW_REFUSALS)),
+])
+def test_cognito_explicit_auth_flows_enable_each_flow_under_auth(monkeypatch, flows, enabled):
+    _, call = _idp_in_process(monkeypatch, auth=True)
+    for flow, answer in _sign_in_with_each_flow(call, flows).items():
+        if flow in enabled:
+            assert not isinstance(answer, tuple), (flow, answer)
+        else:
+            assert answer == ("InvalidParameterException", _FLOW_REFUSALS[flow]), flow
+
+
+def test_cognito_password_flows_not_checked_without_auth(monkeypatch):
+    _, call = _idp_in_process(monkeypatch, auth=False)
+    answers = _sign_in_with_each_flow(call, ["ALLOW_REFRESH_TOKEN_AUTH"])
+    assert answers.pop("CUSTOM_AUTH") == ("InvalidParameterException", _FLOW_REFUSALS["CUSTOM_AUTH"])
+    for answer in answers.values():
+        assert "AuthenticationResult" in answer
 
 
 # ── Test 6: RespondToAuthChallenge — missing Session ─────────────────────────
@@ -10135,7 +10240,13 @@ def test_cognito_secret_hash_dispatch_prevents_side_effects(monkeypatch, action,
         if action in ("SignUp", "ConfirmForgotPassword"):
             payload["Password"] = "Changed1!"
         if action in ("ConfirmSignUp", "ConfirmForgotPassword"):
-            payload["ConfirmationCode"] = "123456"
+            payload["ConfirmationCode"] = "123456" if action == "ConfirmSignUp" else "654321"
+            # A user the code was issued to, so only the secret decides.
+            existing = mod._user_pools[pid]["_users"]["existing"]
+            if action == "ConfirmSignUp":
+                existing.update(UserStatus="UNCONFIRMED", _confirmation_code="123456")
+            else:
+                existing["_reset_code"] = "654321"
         hash_container, hash_key = payload, "SecretHash"
     if action.startswith("Admin"):
         payload["UserPoolId"] = pid

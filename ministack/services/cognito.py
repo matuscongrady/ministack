@@ -2400,11 +2400,40 @@ def _validate_client_secret_hash(action: str, data: dict):
     )
 
 
+# AuthFlow -> (the ExplicitAuthFlows entries that enable it, the refusal without one)
+_PASSWORD_AUTH_FLOWS = {
+    "USER_PASSWORD_AUTH": ({"ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH"},
+                           "USER_PASSWORD_AUTH flow not enabled for this client"),
+    "ADMIN_USER_PASSWORD_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                                 "Auth flow not enabled for this client"),
+    "ADMIN_NO_SRP_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                          "Auth flow not enabled for this client"),
+}
+
+
+def _auth_flow_error(action: str, data: dict):
+    """InvalidParameterException for a password flow the app client's ExplicitAuthFlows leaves out, or None."""
+    flow = data.get("AuthFlow")
+    if (not isinstance(flow, str) or not action.endswith("InitiateAuth")
+            or action.startswith("Admin") != flow.startswith("ADMIN_")):
+        return None
+    enabling = _PASSWORD_AUTH_FLOWS.get(flow)
+    if not enabling:
+        return None
+    cid = data.get("ClientId")
+    pool = _user_pools.get(data.get("UserPoolId")) if action.startswith("Admin") else _pool_for_client(cid)[0]
+    flows = set(((pool or {}).get("_clients", {}).get(cid) or {}).get("ExplicitAuthFlows") or [])
+    if flows and not flows & enabling[0]:
+        return error_response_json("InvalidParameterException", enabling[1], 400)
+    return None
+
+
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
     from ministack.app import AUTH
-    error = (_validate_client_secret_hash(action, data) or _access_token_error(data)) if AUTH else None
+    error = (_validate_client_secret_hash(action, data) or _auth_flow_error(action, data)
+             or _access_token_error(data) or _confirmation_code_error(action, data)) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -4013,9 +4042,10 @@ def _admin_initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
@@ -4321,9 +4351,10 @@ def _initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
@@ -4639,6 +4670,33 @@ def _sign_up(data):
     return json_response(resp)
 
 
+def _code_error(issued, code):
+    """ExpiredCodeException when no code was issued, CodeMismatchException for another code, else None."""
+    if not issued:
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400)
+    if code != issued:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400)
+    return None
+
+
+def _confirmation_code_error(action: str, data: dict):
+    """The error for a ConfirmSignUp or ConfirmForgotPassword the issued code does not allow, or None."""
+    if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
+        return None
+    pool, _pid = _pool_for_client(data.get("ClientId"))
+    user = _resolve_user(pool, data.get("Username"))[0] if pool else None
+    if not user:
+        return None
+    if action == "ConfirmForgotPassword":
+        return _code_error(user.get("_reset_code"), data.get("ConfirmationCode"))
+    if user.get("UserStatus") != "UNCONFIRMED":
+        return error_response_json(
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {user.get('UserStatus')}", 400)
+    return _code_error(user.get("_confirmation_code"), data.get("ConfirmationCode"))
+
+
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
@@ -4656,7 +4714,8 @@ def _confirm_sign_up(data):
     if err:
         return err
 
-    # Accept any code in emulation
+    # Codes are checked under AUTH=true (_confirmation_code_error).
+    user.pop("_confirmation_code", None)
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
@@ -4713,10 +4772,11 @@ def _confirm_forgot_password(data):
             )
         return _err
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
+    user.pop("_reset_code", None)
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
